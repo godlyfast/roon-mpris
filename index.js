@@ -40,6 +40,12 @@ const argv = yargs
         type: 'boolean',
         default: false
     })
+    .option('debug', {
+        alias: 'd',
+        description: 'Enable debug logging of full zone objects to discover undocumented fields',
+        type: 'boolean',
+        default: false
+    })
     .help()
     .argv;
 
@@ -56,19 +62,73 @@ function sanitizeForDBus(displayName) {
     return sanitized || 'unnamed_zone';
 }
 
+// Debug logging helper for zone objects - discover undocumented API fields
+function debugLogZone(label, zone) {
+    if (!argv.debug) return;
+
+    console.log(`\n=== DEBUG: ${label} ===`);
+    console.log('Zone keys:', Object.keys(zone));
+
+    if (zone.now_playing) {
+        console.log('now_playing keys:', Object.keys(zone.now_playing));
+        console.log('Full now_playing:', JSON.stringify(zone.now_playing, null, 2));
+    } else {
+        console.log('now_playing: (none)');
+    }
+
+    if (zone.outputs && zone.outputs.length > 0) {
+        console.log('outputs[0] keys:', Object.keys(zone.outputs[0]));
+        console.log('outputs[0]:', JSON.stringify(zone.outputs[0], null, 2));
+    }
+
+    console.log('=== END DEBUG ===\n');
+}
+
 // Update MPRIS player state from Roon zone data
 function updatePlayerFromZone(context) {
     const { player, zone, wsUrl } = context;
     const now_playing = zone.now_playing;
 
     if (now_playing) {
-        player.metadata = {
-            'mpris:length': now_playing.length ? now_playing.length * 1000 * 1000 : 0, // In microseconds
+        // Base MPRIS metadata
+        const metadata = {
+            'mpris:length': now_playing.length ? now_playing.length * 1000000 : 0, // In microseconds
             'mpris:artUrl': `http://${wsUrl}/image/${now_playing.image_key}`,
             'xesam:title': now_playing.three_line.line1,
             'xesam:album': now_playing.three_line.line3,
             'xesam:artist': now_playing.three_line.line2.split(/\s+\/\s+/),
         };
+
+        // Conditional audio quality metadata (custom roon: prefix)
+        // These fields may exist but are undocumented - discovered via --debug logging
+        if (now_playing.sample_rate) {
+            metadata['roon:sampleRate'] = now_playing.sample_rate;
+        }
+        if (now_playing.bit_depth) {
+            metadata['roon:bitDepth'] = now_playing.bit_depth;
+        }
+        if (now_playing.bitrate) {
+            metadata['roon:bitrate'] = now_playing.bitrate;
+        }
+        if (now_playing.format || now_playing.media_format) {
+            metadata['roon:format'] = now_playing.format || now_playing.media_format;
+        }
+        if (now_playing.source_type) {
+            metadata['roon:sourceType'] = now_playing.source_type;
+        }
+
+        // Check outputs for additional quality info
+        if (zone.outputs && zone.outputs[0]) {
+            const output = zone.outputs[0];
+            if (output.source_controls && output.source_controls[0]) {
+                const source = output.source_controls[0];
+                if (source.sample_rate) {
+                    metadata['roon:outputSampleRate'] = source.sample_rate;
+                }
+            }
+        }
+
+        player.metadata = metadata;
     }
 
     player.playbackStatus = zone.state.charAt(0).toUpperCase() + zone.state.slice(1);
@@ -101,11 +161,67 @@ function setupPlayerEvents(player, zoneId) {
         });
     });
 
-    // Log other events
-    ['raise', 'pause', 'play', 'seek', 'position', 'open', 'volume', 'loopStatus', 'shuffle'].forEach(function(eventName) {
+    // Seek handler - relative seek by offset (microseconds)
+    player.on('seek', (offset) => {
+        const context = zonePlayerMap.get(zoneId);
+        if (!context || !core) {
+            console.log(`Zone "${context?.zone?.display_name}": Seek ignored - no context/core`);
+            return;
+        }
+
+        if (!context.zone.is_seek_allowed) {
+            console.log(`Zone "${context.zone.display_name}": Seek not allowed`);
+            return;
+        }
+
+        // Convert microseconds to seconds
+        const offsetSeconds = offset / 1000000;
+        console.log(`Zone "${context.zone.display_name}": Seek relative ${offsetSeconds}s`);
+
+        core.services.RoonApiTransport.seek(context.zone, 'relative', offsetSeconds, (err) => {
+            if (err) {
+                console.error(`Zone "${context.zone.display_name}": Seek error:`, err);
+            } else {
+                // Calculate new position and emit Seeked signal
+                const currentPos = context.zone.now_playing?.seek_position || 0;
+                const newPosSeconds = Math.max(0, currentPos + offsetSeconds);
+                const newPosMicro = newPosSeconds * 1000000;
+                player.seeked(newPosMicro);
+            }
+        });
+    });
+
+    // Position handler - absolute seek to position (microseconds)
+    player.on('position', (event) => {
+        const context = zonePlayerMap.get(zoneId);
+        if (!context || !core) {
+            console.log(`Zone "${context?.zone?.display_name}": SetPosition ignored - no context/core`);
+            return;
+        }
+
+        if (!context.zone.is_seek_allowed) {
+            console.log(`Zone "${context.zone.display_name}": Seek not allowed`);
+            return;
+        }
+
+        // Convert microseconds to seconds
+        const positionSeconds = event.position / 1000000;
+        console.log(`Zone "${context.zone.display_name}": Seek absolute to ${positionSeconds}s`);
+
+        core.services.RoonApiTransport.seek(context.zone, 'absolute', positionSeconds, (err) => {
+            if (err) {
+                console.error(`Zone "${context.zone.display_name}": Seek error:`, err);
+            } else {
+                player.seeked(event.position);
+            }
+        });
+    });
+
+    // Log remaining unimplemented events
+    ['raise', 'pause', 'play', 'open', 'volume', 'loopStatus', 'shuffle'].forEach(function(eventName) {
         player.on(eventName, function() {
             const context = zonePlayerMap.get(zoneId);
-            console.log(`Zone "${context?.zone?.display_name}": Event ${eventName}`, arguments);
+            console.log(`Zone "${context?.zone?.display_name}": Event ${eventName} (not implemented)`);
         });
     });
 
@@ -132,7 +248,8 @@ function createPlayerContext(zone, wsUrl) {
         player: player,
         zone: zone,
         sanitizedName: sanitizedName,
-        wsUrl: wsUrl
+        wsUrl: wsUrl,
+        lastReportedPosition: 0  // Track position for seek detection
     };
 }
 
@@ -178,11 +295,16 @@ const roon = new RoonApi({
 
         // Normal mode: subscribe to all zones and create MPRIS players
         transport.subscribe_zones(function(cmd, data) {
+            // Guard against callbacks after core disconnect
+            if (!core || !core.moo || !core.moo.transport || !core.moo.transport.ws) {
+                return;
+            }
             const wsUrl = core.moo.transport.ws._url.substring(5);
 
             // Handle initial zone list and newly added zones
             const zonesToAdd = data.zones || data.zones_added || [];
             for (const zone of zonesToAdd) {
+                debugLogZone(`New Zone: ${zone.display_name}`, zone);
                 if (!zonePlayerMap.has(zone.zone_id)) {
                     console.log(`Creating MPRIS player for zone: ${zone.display_name}`);
                     const context = createPlayerContext(zone, wsUrl);
@@ -196,6 +318,12 @@ const roon = new RoonApi({
                 for (const zone of data.zones_changed) {
                     const context = zonePlayerMap.get(zone.zone_id);
                     if (context) {
+                        // Only debug log on track changes, not every state update
+                        const oldTrack = context.zone?.now_playing?.three_line?.line1;
+                        const newTrack = zone?.now_playing?.three_line?.line1;
+                        if (oldTrack !== newTrack) {
+                            debugLogZone(`Track Changed: ${zone.display_name}`, zone);
+                        }
                         context.zone = zone;
                         updatePlayerFromZone(context);
                     }
@@ -219,7 +347,21 @@ const roon = new RoonApi({
                 for (const change of data.zones_seek_changed) {
                     const context = zonePlayerMap.get(change.zone_id);
                     if (context) {
-                        context.player.position = change.seek_position * 1000 * 1000;
+                        const positionMicro = change.seek_position * 1000000;
+                        // Detect actual seeks vs normal playback progress
+                        // Normal playback advances ~1 second per update
+                        const expectedPosition = context.lastReportedPosition + 1500000; // +1.5s tolerance
+                        const positionDelta = Math.abs(positionMicro - expectedPosition);
+                        const isSeek = positionDelta > 2000000; // >2s delta = likely a seek
+
+                        context.lastReportedPosition = positionMicro;
+                        context.player.position = positionMicro;
+
+                        // Only emit Seeked signal on actual seeks, not regular playback
+                        if (isSeek) {
+                            console.log(`Zone "${context.zone.display_name}": Detected seek to ${change.seek_position}s`);
+                            context.player.seeked(positionMicro);
+                        }
                     }
                 }
             }
