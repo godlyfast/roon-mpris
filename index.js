@@ -90,8 +90,15 @@ function updatePlayerFromZone(context) {
     const now_playing = zone.now_playing;
 
     if (now_playing) {
+        // Generate trackid for absolute seek support
+        const trackId = player.objectPath(`track/${zone.zone_id}`);
+        if (argv.debug) {
+            console.log(`DEBUG trackid for ${zone.display_name}: ${trackId}`);
+        }
+
         // Base MPRIS metadata
         const metadata = {
+            'mpris:trackid': trackId, // Required for absolute seek
             'mpris:length': now_playing.length ? now_playing.length * 1000000 : 0, // In microseconds
             'mpris:artUrl': `http://${wsUrl}/image/${now_playing.image_key}`,
             'xesam:title': now_playing.three_line.line1,
