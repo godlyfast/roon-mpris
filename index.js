@@ -50,6 +50,7 @@ const argv = yargs
     .argv;
 
 var core;
+var healTimer;
 const zonePlayerMap = new Map(); // zone_id -> { player, zone, sanitizedName, wsUrl }
 
 // Sanitize zone names for D-Bus (only alphanumeric, underscore, hyphen allowed)
@@ -306,6 +307,7 @@ const roon = new RoonApi({
 
     core_paired: function(core_) {
         core = core_;
+        clearTimeout(healTimer);
         const transport = core.services.RoonApiTransport;
 
         // Handle --pause-all mode: pause everything and exit
@@ -408,6 +410,22 @@ const roon = new RoonApi({
         zonePlayerMap.clear();
 
         core = undefined;
+
+        // Self-heal: a pre-open connect failure poisons roon._sood_conns
+        // (transport onclose is skipped when open never ran), so every later
+        // SOOD announce for that core id is ignored. If still unpaired after
+        // 60s, purge all SOOD connections and restart discovery.
+        clearTimeout(healTimer);
+        healTimer = setTimeout(() => {
+            if (core) return;
+            const conns = roon._sood_conns || {};
+            for (const id of Object.keys(conns)) {
+                try { conns[id].transport.close(); } catch (e) {}
+                delete conns[id];
+            }
+            try { roon.stop_discovery(); } catch (e) {}
+            roon.start_discovery();
+        }, 60000);
     },
 });
 
