@@ -167,6 +167,20 @@ function updatePlayerFromZone(context) {
     // player.canPlay = zone.is_play_allowed; // Ubuntu dock widget disappears if false while playing
     player.canPause = zone.is_pause_allowed;
     player.canSeek = zone.is_seek_allowed;
+
+    // Volume, mapped from Roon's native range (min..max) to MPRIS (0..1).
+    // Only written on a real change, to avoid a feedback loop between the
+    // property change notification and the incoming 'volume' event.
+    const volumeOutput = volumeOutputOf(zone);
+    context.volumeOutput = volumeOutput;
+    if (volumeOutput) {
+        const v = volumeOutput.volume;
+        const span = (v.max - v.min) || 1;
+        const normalized = Math.max(0, Math.min(1, (v.value - v.min) / span));
+        if (typeof player.volume !== 'number' || Math.abs(player.volume - normalized) > 0.005) {
+            player.volume = normalized;
+        }
+    }
 }
 
 // Set up MPRIS event handlers for a specific zone
@@ -248,16 +262,56 @@ function setupPlayerEvents(player, zoneId) {
     });
 
     // Log remaining unimplemented events
-    ['raise', 'pause', 'play', 'open', 'volume', 'loopStatus', 'shuffle'].forEach(function(eventName) {
+    ['raise', 'pause', 'play', 'open', 'loopStatus', 'shuffle'].forEach(function(eventName) {
         player.on(eventName, function() {
             const context = zonePlayerMap.get(zoneId);
             console.log(`Zone "${context?.zone?.display_name}": Event ${eventName} (not implemented)`);
         });
     });
 
+    // Volume requested by the desktop (media volume keys, playerctl, widgets)
+    player.on('volume', (value) => {
+        const context = zonePlayerMap.get(zoneId);
+        if (!context || !core) return;
+        const output = context.volumeOutput;
+        if (!output) {
+            console.log(`Zone "${context.zone?.display_name}": no controllable volume`);
+            return;
+        }
+        const v = output.volume;
+        const span = (v.max - v.min) || 1;
+        const target = v.min + Math.max(0, Math.min(1, Number(value) || 0)) * span;
+        core.services.RoonApiTransport.change_volume(output, 'absolute', target, (err) => {
+            if (err) console.log(`Zone "${context.zone?.display_name}": volume rejected (${err})`);
+        });
+    });
+
     player.on('quit', function() {
         console.log('Quit requested for zone player');
     });
+}
+
+// Zones listed in ROON_MPRIS_EXCLUDE (comma separated) are not exposed as
+// MPRIS players. On a shared Core, every zone in the house shows up, and
+// desktop media keys target the most recently active player — so they
+// silently retarget to someone else's zone as soon as it starts playing.
+const EXCLUDED_ZONES = (process.env.ROON_MPRIS_EXCLUDE || '')
+    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+
+function isZoneExcluded(name) {
+    return EXCLUDED_ZONES.includes(String(name || '').toLowerCase());
+}
+
+// First output of the zone whose volume can drive a slider.
+// "incremental" controls are skipped on purpose: they expose only + / -
+// buttons, with no value and no bounds, so they cannot be normalised.
+function volumeOutputOf(zone) {
+    return (zone.outputs || []).find(o =>
+        o && o.volume &&
+        (o.volume.type === 'number' || o.volume.type === 'db') &&
+        typeof o.volume.value === 'number' &&
+        typeof o.volume.min === 'number' &&
+        typeof o.volume.max === 'number') || null;
 }
 
 // Create MPRIS player for a zone
@@ -336,6 +390,10 @@ const roon = new RoonApi({
             const zonesToAdd = data.zones || data.zones_added || [];
             for (const zone of zonesToAdd) {
                 debugLogZone(`New Zone: ${zone.display_name}`, zone);
+                if (isZoneExcluded(zone.display_name)) {
+                    console.log(`Zone skipped (ROON_MPRIS_EXCLUDE): ${zone.display_name}`);
+                    continue;
+                }
                 if (!zonePlayerMap.has(zone.zone_id)) {
                     console.log(`Creating MPRIS player for zone: ${zone.display_name}`);
                     const context = createPlayerContext(zone, wsUrl);
