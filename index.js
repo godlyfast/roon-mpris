@@ -181,7 +181,7 @@ function setupPlayerEvents(player, zoneId) {
     };
 
     // Transport controls - route to this specific zone
-    ['playpause', 'stop', 'next', 'previous'].forEach(function(eventName) {
+    ['playpause', 'play', 'pause', 'stop', 'next', 'previous'].forEach(function(eventName) {
         player.on(eventName, () => {
             const context = zonePlayerMap.get(zoneId);
             if (context && core) {
@@ -248,7 +248,7 @@ function setupPlayerEvents(player, zoneId) {
     });
 
     // Log remaining unimplemented events
-    ['raise', 'pause', 'play', 'open', 'volume', 'loopStatus', 'shuffle'].forEach(function(eventName) {
+    ['raise', 'open', 'volume', 'loopStatus', 'shuffle'].forEach(function(eventName) {
         player.on(eventName, function() {
             const context = zonePlayerMap.get(zoneId);
             console.log(`Zone "${context?.zone?.display_name}": Event ${eventName} (not implemented)`);
